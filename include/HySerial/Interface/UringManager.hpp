@@ -88,12 +88,12 @@ namespace HySerial
          */
         void bind_fd(int fd);
 
+        // 通用的完成回调类型，它接收整个 CQE 作为参数
+        using CompletionCallback = std::function<void(const io_uring_cqe*)>;
+
     private:
         // 私有构造函数，强制使用 create() 工厂
         UringManager();
-
-        // 通用的完成回调类型，它接收整个 CQE 作为参数
-        using CompletionCallback = std::function<void(const io_uring_cqe*)>;
 
         // 初始化 io_uring 实例
         tl::expected<void, Error> initialize(unsigned int queue_depth);
@@ -107,8 +107,18 @@ namespace HySerial
         io_uring m_ring{};
         std::atomic<bool> m_is_running{false};
 
-        uint64_t m_next_request_id{1};
-        ankerl::unordered_dense::map<uint64_t, CompletionCallback> m_active_requests;
+        std::atomic<uint64_t> m_next_request_id{1};
+
+        struct RequestRecord
+        {
+            CompletionCallback cb;
+            std::shared_ptr<std::vector<std::byte>> buf;
+            size_t offset{0};
+            int fd{-1};
+            bool is_write{false};
+        };
+
+        ankerl::unordered_dense::map<uint64_t, RequestRecord> m_active_requests;
         // lock protecting m_active_requests for cross-thread usage
         SpinLock m_active_lock;
 
@@ -121,6 +131,8 @@ namespace HySerial
         SpinLock m_read_lock;
         SpinLock m_write_lock;
         SpinLock m_error_lock;
+        // protect concurrent calls into io_uring submission path from other threads
+        SpinLock m_submit_lock;
         ReadCallback m_read_cb;
         WriteCallback m_write_cb;
         ErrorCallback m_error_cb;

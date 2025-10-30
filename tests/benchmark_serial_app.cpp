@@ -175,9 +175,9 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    std::sort(latcopy.begin(), latcopy.end());
-    uint64_t sum = std::accumulate(latcopy.begin(), latcopy.end(), uint64_t(0));
-    double mean = double(sum) / latcopy.size();
+    std::ranges::sort(latcopy);
+    uint64_t sum = std::accumulate(latcopy.begin(), latcopy.end(), static_cast<uint64_t>(0));
+    double mean = static_cast<double>(sum) / static_cast<double>(latcopy.size());
     uint64_t p50 = latcopy[latcopy.size() / 2];
     uint64_t p95 = latcopy[std::min<size_t>(latcopy.size() - 1, (size_t)(latcopy.size() * 95 / 100))];
     uint64_t p99 = latcopy[std::min<size_t>(latcopy.size() - 1, (size_t)(latcopy.size() * 99 / 100))];

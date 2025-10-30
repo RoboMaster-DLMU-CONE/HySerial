@@ -44,23 +44,24 @@ namespace HySerial
         {
             m_uring->stop();
         }
-        // jthread destructor will join automatically
+        // Ensure the background thread has stopped BEFORE destroying the UringManager
+        if (m_thread.joinable())
+        {
+            m_thread.join();
+        }
+        // jthread destructor would also join on its own, but we must join here to avoid
+        // the background thread accessing m_uring after we've destroyed it.
         m_uring.reset();
         m_socket.reset();
     }
 
     void Serial::send(std::span<const std::byte> data)
     {
-        if (m_uring)
-        {
             m_uring->submit_send(data);
-        }
     }
 
     void Serial::start_read(size_t buf_size)
     {
-        if (!m_uring || !m_socket)
-            return;
         if (m_socket->sock_fd > 0)
         {
             m_uring->start_read_for_fd(m_socket->sock_fd, buf_size);
