@@ -8,4 +8,5 @@ target_link_libraries(HySerial PRIVATE
         tl::expected
         unordered_dense::unordered_dense
         TBB::tbb
+        ${LIBURING_LIBRARY}
 )

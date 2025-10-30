@@ -15,8 +15,8 @@ namespace HySerial
             return tl::make_unexpected(Error{ErrorCode::UringInitError, "Null uring manager"});
         }
 
-        // Create Serial instance (do not start automatic read here)
-        auto serial = std::make_unique<Serial>(std::move(cfg), std::move(socket), std::move(manager));
+
+        auto serial = std::unique_ptr<Serial>(new Serial(std::move(cfg), std::move(socket), std::move(manager)));
 
         // Start uring manager loop in a jthread
         serial->m_thread = std::jthread([mgr = serial->m_uring.get()](std::stop_token)
