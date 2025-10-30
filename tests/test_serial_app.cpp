@@ -44,12 +44,11 @@ int main(int argc, char** argv)
 
     std::atomic<bool> received{false};
 
-    // set read callback on A
-    serialA->set_read_callback([&](ssize_t n)
+    // set read callback on A (now receives data span)
+    serialA->set_read_callback([&](std::span<const std::byte> data)
     {
-        (void)n;
         received.store(true);
-        std::cout << "serialA read callback: " << n << " bytes\n";
+        std::cout << "serialA read callback: " << data.size() << " bytes\n";
     });
 
     // start continuous read on A
@@ -76,4 +75,3 @@ int main(int argc, char** argv)
     std::cerr << "Test failed: timeout waiting for data\n";
     return 1;
 }
-

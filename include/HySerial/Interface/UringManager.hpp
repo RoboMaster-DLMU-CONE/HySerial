@@ -25,7 +25,8 @@ namespace HySerial
     using IoResult = ssize_t;
 
     // 定义两种回调的类型签名
-    using ReadCallback = std::function<void(IoResult bytes_read)>;
+    // ReadCallback now receives the received data as a span so callers can examine payload
+    using ReadCallback = std::function<void(std::span<const std::byte> data)>;
     using WriteCallback = std::function<void(IoResult bytes_written)>;
     using ErrorCallback = std::function<void(IoResult error_code)>;
 

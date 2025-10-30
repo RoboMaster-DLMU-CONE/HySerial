@@ -19,9 +19,9 @@ int main()
            .stop_bits(StopBits::ONE);
 
     // register simple callbacks
-    builder.on_read([](ssize_t n)
+    builder.on_read([](const std::span<const std::byte> data)
     {
-        std::cout << "Read callback: " << n << " bytes\n";
+        std::cout << "Read callback: " << data.size() << " bytes\n";
     });
 
     builder.on_write([](ssize_t n)
@@ -44,7 +44,10 @@ int main()
     auto serial = std::move(serial_or_err.value());
 
     // set callbacks again (optional) and start reading
-    serial->set_read_callback([](ssize_t n) { std::cout << "(active) Read " << n << " bytes\n"; });
+    serial->set_read_callback([](std::span<const std::byte> data)
+    {
+        std::cout << "(active) Read " << data.size() << " bytes\n";
+    });
     serial->set_send_callback([](ssize_t n) { std::cout << "(active) Sent " << n << " bytes\n"; });
 
     serial->start_read(4096);

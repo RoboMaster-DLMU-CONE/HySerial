@@ -228,7 +228,10 @@ namespace HySerial
                     m_read_lock.unlock();
                     if (rcb)
                     {
-                        rcb(res);
+                        // create a span referencing the internal read buffer of length 'res'
+                        std::span<const std::byte> data(reinterpret_cast<const std::byte*>(m_read_buffer.data()),
+                                                        static_cast<size_t>(res));
+                        rcb(data);
                     }
 
 #ifdef HS_ENABLE_STASIS
@@ -345,7 +348,8 @@ namespace HySerial
                         // update stored offset now that resubmit succeeded
                         m_submit_lock.lock();
                         auto it2 = m_active_requests.find(id);
-                        if (it2 != m_active_requests.end())
+                        if (it2 != m_active_requests.end()
+                        )
                         {
                             it2->second.offset = new_offset;
                         }
