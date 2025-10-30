@@ -1,0 +1,1 @@
+find_library(LIBURING_LIBRARY NAMES uring liburing REQUIRED)
