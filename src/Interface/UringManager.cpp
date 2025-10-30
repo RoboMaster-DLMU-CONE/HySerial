@@ -1,3 +1,4 @@
+#include <cerrno>
 #include <cstring>
 #include <format>
 #include <HySerial/Interface/UringManager.hpp>
@@ -15,6 +16,10 @@ namespace HySerial
         auto res = manager->initialize(queue_depth);
         if (res)
         {
+            // initialize stasis if enabled
+#ifdef HS_ENABLE_STASIS
+            manager->m_stasis = std::make_unique<Stasis>();
+#endif
             return manager;
         }
         return tl::make_unexpected(res.error());
@@ -103,6 +108,13 @@ namespace HySerial
                 m_read_lock.lock();
                 auto cb = m_read_cb;
                 m_read_lock.unlock();
+                // record receive
+#ifdef HS_ENABLE_STASIS
+                if (m_stasis)
+                {
+                    m_stasis->record_receive(static_cast<uint64_t>(cqe->res));
+                }
+#endif
                 if (cb)
                 {
                     cb(cqe->res);
@@ -122,7 +134,6 @@ namespace HySerial
     {
         if (m_fd < 0)
         {
-            std::cerr << "[FATAL] UringManager: submit_send called with invalid fd\n";
             return;
         }
 
@@ -139,6 +150,7 @@ namespace HySerial
 
         CompletionCallback completion_cb = [this, buf](const io_uring_cqe* cqe)
         {
+            (void)buf; // keep shared_ptr alive and silence unused-capture warning
             if (cqe->res < 0)
             {
                 m_error_lock.lock();
@@ -161,6 +173,10 @@ namespace HySerial
             {
                 cb(cqe->res);
             }
+
+#ifdef HS_ENABLE_STASIS
+            if (m_stasis) m_stasis->record_send(static_cast<uint64_t>(cqe->res));
+#endif
         };
 
         submit_request(sqe, std::move(completion_cb));
@@ -189,12 +205,14 @@ namespace HySerial
                 }
 
                 CompletionCallback cb;
+                m_active_lock.lock();
                 auto it = m_active_requests.find(request_id);
                 if (it != m_active_requests.end())
                 {
                     cb = it->second;
                     m_active_requests.erase(it);
                 }
+                m_active_lock.unlock();
 
                 if (cb)
                 {
@@ -225,7 +243,7 @@ namespace HySerial
         if (io_uring_queue_init(queue_depth, &m_ring, 0) < 0)
         {
             return tl::make_unexpected(Error{
-                ErrorCode::UringInitError, std::format("UringManager init failed: {}", strerror(errno))
+                ErrorCode::UringInitError, std::string("UringManager init failed: ") + strerror(errno)
             });
         }
         return {};
@@ -235,13 +253,20 @@ namespace HySerial
     {
         const uint64_t request_id = m_next_request_id++;
 
+        m_active_lock.lock();
         m_active_requests.emplace(request_id, std::move(callback));
+        m_active_lock.unlock();
 
         io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(request_id));
 
         if (const int ret = io_uring_submit(&m_ring); ret < 0)
         {
-            throw std::runtime_error(std::format("io_uring_submit failed with {}", ret));
+            throw std::runtime_error(std::string("io_uring_submit failed with ") + std::to_string(ret));
         }
+    }
+
+    void UringManager::bind_fd(int fd)
+    {
+        m_fd = fd;
     }
 }

@@ -15,7 +15,13 @@ namespace HySerial
             return tl::make_unexpected(Error{ErrorCode::UringInitError, "Null uring manager"});
         }
 
+        // Before creating Serial, bind the socket fd to the manager so submit_send can work
+        if (socket->sock_fd > 0)
+        {
+            manager->bind_fd(socket->sock_fd);
+        }
 
+        // Create Serial instance (do not start automatic read here)
         auto serial = std::unique_ptr<Serial>(new Serial(std::move(cfg), std::move(socket), std::move(manager)));
 
         // Start uring manager loop in a jthread

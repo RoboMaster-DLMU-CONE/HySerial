@@ -1,0 +1,193 @@
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <iostream>
+#include <mutex>
+#include <numeric>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <HySerial/Builder/Builder.hpp>
+
+using namespace HySerial;
+using namespace std::chrono;
+
+static uint64_t now_ns()
+{
+    return static_cast<uint64_t>(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
+}
+
+int main(int argc, char** argv)
+{
+    if (argc < 3)
+    {
+        std::cerr << "Usage: benchmark_serial_app <devA> <devB> [count] [payload_size]\n";
+        return 2;
+    }
+    const char* devA = argv[1];
+    const char* devB = argv[2];
+    const int count = (argc >= 4) ? std::stoi(argv[3]) : 1000;
+    const int payload_size = (argc >= 5) ? std::stoi(argv[4]) : 16;
+
+    Builder bA;
+    bA.device(devA).baud_rate(115200);
+    Builder bB;
+    bB.device(devB).baud_rate(115200);
+
+    auto sa = bA.build();
+    if (!sa)
+    {
+        std::cerr << "Failed to create A: " << sa.error().message << "\n";
+        return 1;
+    }
+    auto serialA = std::move(sa.value());
+
+    auto sb = bB.build();
+    if (!sb)
+    {
+        std::cerr << "Failed to create B: " << sb.error().message << "\n";
+        return 1;
+    }
+    auto serialB = std::move(sb.value());
+
+    const size_t frame_size = sizeof(uint64_t) + sizeof(uint64_t) + payload_size; // seq + ts + payload
+
+    std::vector<uint64_t> latencies_ns;
+    latencies_ns.reserve(count);
+    std::mutex lat_mtx;
+    std::vector<std::byte> rx_accum;
+    rx_accum.reserve(frame_size * 4);
+    std::atomic<int> received{0};
+
+    // read callback for A: accumulate bytes and parse frames
+    serialA->set_read_callback([&](ssize_t n)
+    {
+        // Read callback receives n bytes available; but we do not get the bytes here.
+        // HySerial's read callback provides only the byte count; actual buffer is internal.
+        // For this benchmark, we will assume read callback triggers when data arrives and
+        // rely on the serial's continuous read and not reconstruct payload here.
+        // To measure accurate latencies, we embed timestamp and rely on the fact that
+        // HySerial currently doesn't expose buffer contents in callback. Therefore,
+        // this benchmark instead measures callback latency as an approximation: we cannot
+        // extract sender timestamp without changing HySerial API.
+    });
+
+    // Unfortunately, current HySerial read callback API only provides bytes count, not data buffer.
+    // To measure end-to-end latency accurately we need access to received data. We'll open the
+    // same device with a raw POSIX fd to read the data directly for measurement while HySerial
+    // is also open. We'll open devA as raw fd for reading here.
+    int raw_fd = -1;
+    {
+        raw_fd = ::open(devA, O_RDWR | O_NOCTTY);
+        if (raw_fd == -1)
+        {
+            std::cerr << "Failed to open raw fd for " << devA << ": " << strerror(errno) << "\n";
+            return 1;
+        }
+        // Set non-blocking
+        int flags = fcntl(raw_fd, F_GETFL, 0);
+        fcntl(raw_fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    std::atomic<bool> stop_flag{false};
+
+    // thread to read raw_fd and parse frames
+    std::thread reader([&]()
+    {
+        std::vector<std::byte> buf(4096);
+        std::vector<std::byte> local_acc;
+        local_acc.reserve(frame_size * 4);
+        while (!stop_flag.load())
+        {
+            ssize_t r = ::read(raw_fd, buf.data(), (ssize_t)buf.size());
+            if (r > 0)
+            {
+                local_acc.insert(local_acc.end(), buf.begin(), buf.begin() + r);
+                // parse frames
+                while (local_acc.size() >= frame_size)
+                {
+                    // extract seq and ts
+                    uint64_t seq = 0;
+                    uint64_t ts = 0;
+                    // copy bytes
+                    std::memcpy(&seq, local_acc.data(), sizeof(uint64_t));
+                    std::memcpy(&ts, local_acc.data() + sizeof(uint64_t), sizeof(uint64_t));
+                    uint64_t now = now_ns();
+                    uint64_t lat = (now > ts) ? (now - ts) : 0;
+                    {
+                        std::lock_guard lock(lat_mtx);
+                        latencies_ns.push_back(lat);
+                    }
+                    received.fetch_add(1);
+                    // erase processed
+                    local_acc.erase(local_acc.begin(), local_acc.begin() + frame_size);
+                }
+            }
+            else
+            {
+                // no data
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+    });
+
+    // bind manager fd as well to ensure send works
+    // Serial::create already binds fd; assume serialB is ready.
+
+    // Sender: send frames as fast as possible
+    for (uint64_t i = 0; i < static_cast<uint64_t>(count); ++i)
+    {
+        std::vector<std::byte> frame(frame_size);
+        uint64_t seq = i;
+        uint64_t ts = now_ns();
+        std::memcpy(frame.data(), &seq, sizeof(seq));
+        std::memcpy(frame.data() + sizeof(seq), &ts, sizeof(ts));
+        // fill payload with pattern
+        for (int k = 0; k < payload_size; ++k) frame[sizeof(seq) + sizeof(ts) + k] = static_cast<std::byte>(k & 0xFF);
+        serialB->send(std::span<const std::byte>(frame.data(), frame.size()));
+    }
+
+    // wait for all messages or timeout
+    auto start_wait = steady_clock::now();
+    while (received.load() < count)
+    {
+        if (steady_clock::now() - start_wait > seconds(10)) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    stop_flag.store(true);
+    reader.join();
+    ::close(raw_fd);
+
+    // compute stats
+    std::vector<uint64_t> latcopy;
+    {
+        std::lock_guard lock(lat_mtx);
+        latcopy = latencies_ns;
+    }
+
+    if (latcopy.empty())
+    {
+        std::cerr << "No packets received\n";
+        return 1;
+    }
+
+    std::sort(latcopy.begin(), latcopy.end());
+    uint64_t sum = std::accumulate(latcopy.begin(), latcopy.end(), uint64_t(0));
+    double mean = double(sum) / latcopy.size();
+    uint64_t p50 = latcopy[latcopy.size() / 2];
+    uint64_t p95 = latcopy[std::min<size_t>(latcopy.size() - 1, (size_t)(latcopy.size() * 95 / 100))];
+    uint64_t p99 = latcopy[std::min<size_t>(latcopy.size() - 1, (size_t)(latcopy.size() * 99 / 100))];
+    uint64_t minv = latcopy.front();
+    uint64_t maxv = latcopy.back();
+
+    std::cout << "Messages sent: " << count << " received: " << latcopy.size() << "\n";
+    std::cout << "Min(us): " << (minv / 1000.0) << " Mean(us): " << (mean / 1000.0) << " P50(us): " << (p50 / 1000.0)
+        << " P95(us): " << (p95 / 1000.0) << " P99(us): " << (p99 / 1000.0) << " Max(us): " << (maxv / 1000.0) << "\n";
+
+    return 0;
+}
+

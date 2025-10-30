@@ -7,12 +7,16 @@
 #include <span>
 #include <atomic>
 #include <vector>
-#include <unordered_map>
+#include <ankerl/unordered_dense.h>
+
+#include <tl/expected.hpp>
+#include <HySerial/Util/Error.hpp>
 
 #include <HySerial/Util/SpinLock.hpp>
-#include <tl/expected.hpp>
 
-#include "HySerial/Util/Error.hpp"
+#ifdef HS_ENABLE_STASIS
+#include <HySerial/Stats.hpp>
+#endif
 
 
 namespace HySerial
@@ -79,6 +83,11 @@ namespace HySerial
          */
         void stop_read_for_fd();
 
+        /**
+         * @brief 将管理器绑定到 fd（仅设置 fd，用于 write 或延迟启动 read）
+         */
+        void bind_fd(int fd);
+
     private:
         // 私有构造函数，强制使用 create() 工厂
         UringManager();
@@ -99,7 +108,9 @@ namespace HySerial
         std::atomic<bool> m_is_running{false};
 
         uint64_t m_next_request_id{1};
-        std::unordered_map<uint64_t, CompletionCallback> m_active_requests;
+        ankerl::unordered_dense::map<uint64_t, CompletionCallback> m_active_requests;
+        // lock protecting m_active_requests for cross-thread usage
+        SpinLock m_active_lock;
 
         // single-fd helpers
         int m_fd{-1};
@@ -113,6 +124,11 @@ namespace HySerial
         ReadCallback m_read_cb;
         WriteCallback m_write_cb;
         ErrorCallback m_error_cb;
+
+#ifdef HS_ENABLE_STASIS
+        // optional stats collector
+        std::unique_ptr<Stasis> m_stasis;
+#endif
     };
 }
 

@@ -167,8 +167,8 @@ namespace HySerial
         // Local flags - raw mode
         tty.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
 
-        // Control characters - non-blocking reads
-        tty.c_cc[VMIN] = 0;
+        // Control characters - block until at least 1 byte is available
+        tty.c_cc[VMIN] = 1;
         tty.c_cc[VTIME] = 0;
 
         // Apply attributes
@@ -199,10 +199,10 @@ namespace HySerial
             }
         }
 
-        // Flush and ensure non-blocking
+        // Flush and ensure blocking (clear O_NONBLOCK)
         tcflush(sock_fd, TCIOFLUSH);
         const int flags = fcntl(sock_fd, F_GETFL, 0);
-        fcntl(sock_fd, F_SETFL, flags | O_NONBLOCK);
+        fcntl(sock_fd, F_SETFL, flags & ~O_NONBLOCK);
 
         return {};
     }
