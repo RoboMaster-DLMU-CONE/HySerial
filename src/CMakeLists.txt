@@ -8,7 +8,10 @@ if (HS_ENABLE_STASIS)
 endif ()
 
 target_sources(HySerial PRIVATE ${HYSERIAL_SOURCES})
-target_include_directories(HySerial PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_include_directories(HySerial PUBLIC
+        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
 target_link_libraries(HySerial PUBLIC
         tl::expected
         ${LIBURING_LIBRARY}

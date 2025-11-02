@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(HySerial)
+project(HySerial VERSION 0.2.0)
 
 set(CMAKE_CXX_STANDARD 20)
 
@@ -21,3 +21,5 @@ if (HS_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif ()
+
+include(HySerialInstall)
