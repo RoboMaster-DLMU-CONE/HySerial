@@ -108,9 +108,19 @@ namespace HySerial
         }
 
         RequestRecord rec;
+        rec.id = id; // Phase 2: Store id for arena validation
         rec.is_write = false;
         rec.fd = m_fd;
-        m_active_requests.emplace(id, std::move(rec));
+
+        // Phase 2: Try arena first, fallback to map
+        if (m_request_arena.find(id) == nullptr)
+        {
+            m_request_arena.insert(id, rec);
+        }
+        else
+        {
+            m_active_requests.emplace(id, std::move(rec));
+        }
 
         io_uring_prep_read(sqe, m_fd, m_read_buffer.data(), m_read_buffer.size(), -1);
         set_user_data(sqe, id);
@@ -118,6 +128,7 @@ namespace HySerial
         if (const int ret = io_uring_submit(&m_ring); ret < 0)
         {
             // cleanup
+            m_request_arena.erase(id);
             m_active_requests.erase(id);
             m_uring_lock.unlock();
             throw std::runtime_error(std::string("io_uring_submit failed with ") + std::to_string(ret));
@@ -132,7 +143,9 @@ namespace HySerial
             return;
         }
 
-        auto buf = std::make_shared<std::vector<std::byte>>(buffer.begin(), buffer.end());
+        // Phase 2: Use BufferPool for zero-copy writes
+        auto buf = m_buffer_pool.acquire(buffer.size());
+        buf->insert(buf->end(), buffer.begin(), buffer.end());
 
         // allocate id
         uint64_t id = m_next_request_id.fetch_add(1);
@@ -143,15 +156,26 @@ namespace HySerial
         if (!sqe)
         {
             m_uring_lock.unlock();
+            m_buffer_pool.release(buf);
             return;
         }
 
         RequestRecord rec;
+        rec.id = id; // Phase 2: Store id for arena validation
         rec.is_write = true;
         rec.fd = m_fd;
         rec.buf = buf;
         rec.offset = 0;
-        m_active_requests.emplace(id, std::move(rec));
+
+        // Phase 2: Try arena first, fallback to map
+        if (m_request_arena.find(id) == nullptr)
+        {
+            m_request_arena.insert(id, rec);
+        }
+        else
+        {
+            m_active_requests.emplace(id, std::move(rec));
+        }
 
         // prepare initial write for the whole buffer
         io_uring_prep_write(sqe, m_fd, buf->data(), buf->size(), -1);
@@ -160,7 +184,9 @@ namespace HySerial
         if (const int ret = io_uring_submit(&m_ring); ret < 0)
         {
             // cleanup
+            m_request_arena.erase(id);
             m_active_requests.erase(id);
+            m_buffer_pool.release(buf);
             m_uring_lock.unlock();
             throw std::runtime_error(std::string("io_uring_submit failed with ") + std::to_string(ret));
         }
@@ -193,14 +219,34 @@ namespace HySerial
 
                 // lookup and copy request record atomically, then release lock before any submit calls
                 m_uring_lock.lock();
-                auto it = m_active_requests.find(id);
-                if (it == m_active_requests.end())
+
+                // Phase 2: Try RequestArena first for O(1) lookup
+                RequestRecord* rec_ptr = m_request_arena.find(id);
+                RequestRecord record;
+                bool found = false;
+
+                if (rec_ptr != nullptr)
                 {
-                    m_uring_lock.unlock();
+                    record = *rec_ptr;
+                    found = true;
+                }
+                else
+                {
+                    // Fallback to map if not in arena (collision case)
+                    auto it = m_active_requests.find(id);
+                    if (it != m_active_requests.end())
+                    {
+                        record = it->second;
+                        found = true;
+                    }
+                }
+
+                m_uring_lock.unlock();
+
+                if (!found)
+                {
                     continue;
                 }
-                RequestRecord record = it->second; // copy the shared_ptr and small fields
-                m_uring_lock.unlock();
 
                 bool is_write = record.is_write;
                 int res = cqe->res;
@@ -222,6 +268,7 @@ namespace HySerial
                         }
                         // cleanup record
                         m_uring_lock.lock();
+                        m_request_arena.erase(id);
                         m_active_requests.erase(id);
                         m_uring_lock.unlock();
                         continue;
@@ -243,6 +290,7 @@ namespace HySerial
 
                     // remove record and request rearm after CQ processing
                     m_uring_lock.lock();
+                    m_request_arena.erase(id);
                     m_active_requests.erase(id);
                     m_uring_lock.unlock();
                     if (m_continue_read.load(std::memory_order_relaxed))
@@ -265,6 +313,7 @@ namespace HySerial
                         if (ecb_ptr && *ecb_ptr) (*ecb_ptr)(-EINTR);
                         // cleanup record
                         m_uring_lock.lock();
+                        m_request_arena.erase(id);
                         m_active_requests.erase(id);
                         m_uring_lock.unlock();
                         continue;
@@ -278,6 +327,7 @@ namespace HySerial
                         auto* ecb_ptr = m_error_cb_ptr.load(std::memory_order_acquire);
                         if (ecb_ptr && *ecb_ptr) (*ecb_ptr)(ret);
                         m_uring_lock.lock();
+                        m_request_arena.erase(id);
                         m_active_requests.erase(id);
                         m_uring_lock.unlock();
                     }
@@ -301,6 +351,7 @@ namespace HySerial
                             '\n';
                     }
                     m_uring_lock.lock();
+                    m_request_arena.erase(id);
                     m_active_requests.erase(id);
                     m_uring_lock.unlock();
                     continue;
@@ -319,7 +370,9 @@ namespace HySerial
                         auto* ecb_ptr = m_error_cb_ptr.load(std::memory_order_acquire);
                         if (ecb_ptr && *ecb_ptr) (*ecb_ptr)(-EAGAIN);
                         m_uring_lock.lock();
+                        m_request_arena.erase(id);
                         m_active_requests.erase(id);
+                        if (record.buf) m_buffer_pool.release(record.buf);
                         m_uring_lock.unlock();
                         continue;
                     }
@@ -332,7 +385,9 @@ namespace HySerial
                         auto* ecb_ptr = m_error_cb_ptr.load(std::memory_order_acquire);
                         if (ecb_ptr && *ecb_ptr) (*ecb_ptr)(ret);
                         m_uring_lock.lock();
+                        m_request_arena.erase(id);
                         m_active_requests.erase(id);
+                        if (record.buf) m_buffer_pool.release(record.buf);
                         m_uring_lock.unlock();
                     }
                     else
@@ -361,7 +416,13 @@ namespace HySerial
                 if (m_stasis) m_stasis->record_send(static_cast<uint64_t>(new_offset));
 #endif
 
+                // Phase 2: Release buffer back to pool and cleanup record
+                if (record.is_write && record.buf)
+                {
+                    m_buffer_pool.release(record.buf);
+                }
                 m_uring_lock.lock();
+                m_request_arena.erase(id);
                 m_active_requests.erase(id);
                 m_uring_lock.unlock();
             }
@@ -400,8 +461,17 @@ namespace HySerial
                 ErrorCode::UringInitError, std::string("UringManager init failed: ") + strerror(errno)
             });
         }
+
+        // Phase 2: Initialize RequestArena for O(1) request tracking
+        m_request_arena = RequestArena(queue_depth);
+
+        // Phase 2: Initialize BufferPool for zero-copy writes
+        // Pool size is 2x queue_depth to account for concurrent writes
+        m_buffer_pool = BufferPool(static_cast<size_t>(queue_depth) * 2, 8192);
+
         return {};
     }
+
 
     void UringManager::submit_request(io_uring_sqe* sqe, CompletionCallback callback)
     {

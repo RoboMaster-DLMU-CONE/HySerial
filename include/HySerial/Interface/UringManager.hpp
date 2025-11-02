@@ -93,6 +93,140 @@ namespace HySerial
         using CompletionCallback = std::function<void(const io_uring_cqe*)>;
 
     private:
+        // RequestRecord 需要在 RequestArena 前面定义
+        struct RequestRecord
+        {
+            CompletionCallback cb;
+            std::shared_ptr<std::vector<std::byte>> buf;
+            uint64_t id{0}; // Phase 2: For arena collision detection
+            size_t offset{0};
+            int fd{-1};
+            bool is_write{false};
+        };
+
+        // Phase 2: RequestArena - O(1) request tracking using array indexing
+        class RequestArena
+        {
+        public:
+            explicit RequestArena(uint32_t queue_depth = 0)
+                : m_queue_depth(queue_depth),
+                  m_records(queue_depth),
+                  m_occupied(queue_depth)
+            {
+                for (auto& occ : m_occupied)
+                {
+                    occ.store(false, std::memory_order_relaxed);
+                }
+            }
+
+            void insert(uint64_t id, const RequestRecord& rec)
+            {
+                if (m_queue_depth == 0) return;
+                const uint32_t idx = id % m_queue_depth;
+                m_records[idx] = rec;
+                m_occupied[idx].store(true, std::memory_order_release);
+            }
+
+            RequestRecord* find(uint64_t id)
+            {
+                if (m_queue_depth == 0) return nullptr;
+                uint32_t idx = id % m_queue_depth;
+                if (m_occupied[idx].load(std::memory_order_acquire))
+                {
+                    if (m_records[idx].id == id)
+                    {
+                        return &m_records[idx];
+                    }
+                }
+                return nullptr;
+            }
+
+            void erase(uint64_t id)
+            {
+                if (m_queue_depth == 0) return;
+                const uint32_t idx = id % m_queue_depth;
+                m_occupied[idx].store(false, std::memory_order_release);
+            }
+
+            void clear()
+            {
+                for (auto& occ : m_occupied)
+                {
+                    occ.store(false, std::memory_order_relaxed);
+                }
+            }
+
+        private:
+            uint32_t m_queue_depth;
+            std::vector<RequestRecord> m_records;
+            std::vector<std::atomic<bool>> m_occupied;
+        };
+
+        // Phase 2: BufferPool - Zero-copy buffer reuse for writes
+        class BufferPool
+        {
+        public:
+            explicit BufferPool(size_t pool_size = 0, size_t buffer_size = 8192)
+                : m_pool_size(pool_size),
+                  m_buffer_size(buffer_size),
+                  m_buffers(pool_size),
+                  m_available(pool_size)
+            {
+                for (size_t i = 0; i < pool_size; ++i)
+                {
+                    m_buffers[i] = std::make_shared<std::vector<std::byte>>(buffer_size);
+                    m_available[i].store(true, std::memory_order_relaxed);
+                }
+            }
+
+            std::shared_ptr<std::vector<std::byte>> acquire(size_t needed_size)
+            {
+                if (m_pool_size == 0)
+                {
+                    return std::make_shared<std::vector<std::byte>>(needed_size);
+                }
+
+                for (size_t i = 0; i < m_pool_size; ++i)
+                {
+                    bool expected = true;
+                    if (m_available[i].compare_exchange_strong(
+                        expected, false, std::memory_order_acquire, std::memory_order_relaxed))
+                    {
+                        auto& buf = m_buffers[i];
+                        if (buf->capacity() < needed_size)
+                        {
+                            buf->reserve(needed_size);
+                        }
+                        buf->clear();
+                        return buf;
+                    }
+                }
+
+                return std::make_shared<std::vector<std::byte>>(needed_size);
+            }
+
+            void release(const std::shared_ptr<std::vector<std::byte>>& buf)
+            {
+                if (m_pool_size == 0) return;
+
+                for (size_t i = 0; i < m_pool_size; ++i)
+                {
+                    if (m_buffers[i] == buf)
+                    {
+                        buf->clear();
+                        m_available[i].store(true, std::memory_order_release);
+                        return;
+                    }
+                }
+            }
+
+        private:
+            size_t m_pool_size;
+            size_t m_buffer_size{};
+            std::vector<std::shared_ptr<std::vector<std::byte>>> m_buffers;
+            std::vector<std::atomic<bool>> m_available;
+        };
+
         // 私有构造函数，强制使用 create() 工厂
         UringManager();
 
@@ -105,21 +239,19 @@ namespace HySerial
         // 提交异步读请求（不对外公开）
         void submit_read();
 
+        // Phase 2: Replace unordered_map with RequestArena
+        RequestArena m_request_arena;
+        // Fallback map for compatibility
+        ankerl::unordered_dense::map<uint64_t, RequestRecord> m_active_requests;
+
+        // Phase 2: Buffer pool for zero-copy writes
+        BufferPool m_buffer_pool;
+
         io_uring m_ring{};
         std::atomic<bool> m_is_running{false};
 
         std::atomic<uint64_t> m_next_request_id{1};
 
-        struct RequestRecord
-        {
-            CompletionCallback cb;
-            std::shared_ptr<std::vector<std::byte>> buf;
-            size_t offset{0};
-            int fd{-1};
-            bool is_write{false};
-        };
-
-        ankerl::unordered_dense::map<uint64_t, RequestRecord> m_active_requests;
 
         // single-fd helpers
         int m_fd{-1};
