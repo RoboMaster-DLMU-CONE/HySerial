@@ -120,23 +120,23 @@ namespace HySerial
         };
 
         ankerl::unordered_dense::map<uint64_t, RequestRecord> m_active_requests;
-        // lock protecting m_active_requests for cross-thread usage
-        SpinLock m_active_lock;
 
         // single-fd helpers
         int m_fd{-1};
         std::vector<std::byte> m_read_buffer;
         std::atomic<bool> m_continue_read{false};
 
-        // callbacks protected by spinlocks
-        SpinLock m_read_lock;
-        SpinLock m_write_lock;
-        SpinLock m_error_lock;
-        // protect concurrent calls into io_uring submission path from other threads
-        SpinLock m_submit_lock;
-        ReadCallback m_read_cb;
-        WriteCallback m_write_cb;
-        ErrorCallback m_error_cb;
+        // Phase 1 optimization: Single unified lock for io_uring and active_requests
+        SpinLock m_uring_lock;
+
+        // Phase 1 optimization: Atomic callback pointers for lock-free access
+        std::unique_ptr<ReadCallback> m_read_cb_storage;
+        std::unique_ptr<WriteCallback> m_write_cb_storage;
+        std::unique_ptr<ErrorCallback> m_error_cb_storage;
+
+        std::atomic<ReadCallback*> m_read_cb_ptr{nullptr};
+        std::atomic<WriteCallback*> m_write_cb_ptr{nullptr};
+        std::atomic<ErrorCallback*> m_error_cb_ptr{nullptr};
 
 #ifdef HS_ENABLE_STASIS
         // optional stats collector
