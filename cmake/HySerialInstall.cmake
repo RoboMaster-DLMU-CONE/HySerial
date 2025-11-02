@@ -10,6 +10,14 @@ install(TARGETS HySerial
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
+
+# Install custom find modules for dependencies
+install(FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules/FindLiburing.cmake
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules/FindTlExpected.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}/Modules
+)
+
 install(EXPORT HySerialTargets
         FILE HySerialTargets.cmake
         NAMESPACE HySerial::
