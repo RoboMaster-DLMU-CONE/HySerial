@@ -1,0 +1,37 @@
+name: Test HySerial
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+
+  workflow_dispatch:
+jobs:
+  test-project:
+    name: Run CTest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y pkg-config libexpected-dev liburing-dev socat
+
+      - name: Setup cmake
+        uses: lukka/get-cmake@latest
+
+      - name: Build Project
+        run: |
+          cmake -S . -B build -G Ninja -DHS_BUILD_TESTS=ON -DHS_ENABLE_STASIS=ON
+          cmake --build build
+
+      - name: Install HySerial and Daemon
+        run: |
+          sudo cmake --install build
+
+      - name: Test Project (No Root Required)
+        run: |
+          cd build
+          ctest --output-on-failure
