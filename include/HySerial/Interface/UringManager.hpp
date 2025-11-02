@@ -7,7 +7,6 @@
 #include <span>
 #include <atomic>
 #include <vector>
-#include <ankerl/unordered_dense.h>
 
 #include <tl/expected.hpp>
 #include <HySerial/Util/Error.hpp>
@@ -241,8 +240,6 @@ namespace HySerial
 
         // Phase 2: Replace unordered_map with RequestArena
         RequestArena m_request_arena;
-        // Fallback map for compatibility
-        ankerl::unordered_dense::map<uint64_t, RequestRecord> m_active_requests;
 
         // Phase 2: Buffer pool for zero-copy writes
         BufferPool m_buffer_pool;

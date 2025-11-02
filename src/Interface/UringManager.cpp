@@ -111,16 +111,7 @@ namespace HySerial
         rec.id = id; // Phase 2: Store id for arena validation
         rec.is_write = false;
         rec.fd = m_fd;
-
-        // Phase 2: Try arena first, fallback to map
-        if (m_request_arena.find(id) == nullptr)
-        {
-            m_request_arena.insert(id, rec);
-        }
-        else
-        {
-            m_active_requests.emplace(id, std::move(rec));
-        }
+        m_request_arena.insert(id, rec);
 
         io_uring_prep_read(sqe, m_fd, m_read_buffer.data(), m_read_buffer.size(), -1);
         set_user_data(sqe, id);
@@ -129,7 +120,6 @@ namespace HySerial
         {
             // cleanup
             m_request_arena.erase(id);
-            m_active_requests.erase(id);
             m_uring_lock.unlock();
             throw std::runtime_error(std::string("io_uring_submit failed with ") + std::to_string(ret));
         }
@@ -166,16 +156,7 @@ namespace HySerial
         rec.fd = m_fd;
         rec.buf = buf;
         rec.offset = 0;
-
-        // Phase 2: Try arena first, fallback to map
-        if (m_request_arena.find(id) == nullptr)
-        {
-            m_request_arena.insert(id, rec);
-        }
-        else
-        {
-            m_active_requests.emplace(id, std::move(rec));
-        }
+        m_request_arena.insert(id, rec);
 
         // prepare initial write for the whole buffer
         io_uring_prep_write(sqe, m_fd, buf->data(), buf->size(), -1);
@@ -185,7 +166,6 @@ namespace HySerial
         {
             // cleanup
             m_request_arena.erase(id);
-            m_active_requests.erase(id);
             m_buffer_pool.release(buf);
             m_uring_lock.unlock();
             throw std::runtime_error(std::string("io_uring_submit failed with ") + std::to_string(ret));
@@ -220,33 +200,15 @@ namespace HySerial
                 // lookup and copy request record atomically, then release lock before any submit calls
                 m_uring_lock.lock();
 
-                // Phase 2: Try RequestArena first for O(1) lookup
+                // Phase 2: O(1) lookup using RequestArena
                 RequestRecord* rec_ptr = m_request_arena.find(id);
-                RequestRecord record;
-                bool found = false;
-
-                if (rec_ptr != nullptr)
+                if (!rec_ptr)
                 {
-                    record = *rec_ptr;
-                    found = true;
-                }
-                else
-                {
-                    // Fallback to map if not in arena (collision case)
-                    auto it = m_active_requests.find(id);
-                    if (it != m_active_requests.end())
-                    {
-                        record = it->second;
-                        found = true;
-                    }
-                }
-
-                m_uring_lock.unlock();
-
-                if (!found)
-                {
+                    m_uring_lock.unlock();
                     continue;
                 }
+                RequestRecord record = *rec_ptr;
+                m_uring_lock.unlock();
 
                 bool is_write = record.is_write;
                 int res = cqe->res;
@@ -269,7 +231,6 @@ namespace HySerial
                         // cleanup record
                         m_uring_lock.lock();
                         m_request_arena.erase(id);
-                        m_active_requests.erase(id);
                         m_uring_lock.unlock();
                         continue;
                     }
@@ -291,7 +252,6 @@ namespace HySerial
                     // remove record and request rearm after CQ processing
                     m_uring_lock.lock();
                     m_request_arena.erase(id);
-                    m_active_requests.erase(id);
                     m_uring_lock.unlock();
                     if (m_continue_read.load(std::memory_order_relaxed))
                     {
@@ -314,7 +274,6 @@ namespace HySerial
                         // cleanup record
                         m_uring_lock.lock();
                         m_request_arena.erase(id);
-                        m_active_requests.erase(id);
                         m_uring_lock.unlock();
                         continue;
                     }
@@ -328,7 +287,6 @@ namespace HySerial
                         if (ecb_ptr && *ecb_ptr) (*ecb_ptr)(ret);
                         m_uring_lock.lock();
                         m_request_arena.erase(id);
-                        m_active_requests.erase(id);
                         m_uring_lock.unlock();
                     }
                     else
@@ -352,7 +310,6 @@ namespace HySerial
                     }
                     m_uring_lock.lock();
                     m_request_arena.erase(id);
-                    m_active_requests.erase(id);
                     m_uring_lock.unlock();
                     continue;
                 }
@@ -371,7 +328,6 @@ namespace HySerial
                         if (ecb_ptr && *ecb_ptr) (*ecb_ptr)(-EAGAIN);
                         m_uring_lock.lock();
                         m_request_arena.erase(id);
-                        m_active_requests.erase(id);
                         if (record.buf) m_buffer_pool.release(record.buf);
                         m_uring_lock.unlock();
                         continue;
@@ -386,7 +342,6 @@ namespace HySerial
                         if (ecb_ptr && *ecb_ptr) (*ecb_ptr)(ret);
                         m_uring_lock.lock();
                         m_request_arena.erase(id);
-                        m_active_requests.erase(id);
                         if (record.buf) m_buffer_pool.release(record.buf);
                         m_uring_lock.unlock();
                     }
@@ -395,10 +350,10 @@ namespace HySerial
                         m_uring_lock.unlock();
                         // update stored offset now that resubmit succeeded
                         m_uring_lock.lock();
-                        auto it2 = m_active_requests.find(id);
-                        if (it2 != m_active_requests.end())
+                        RequestRecord* rec_ptr2 = m_request_arena.find(id);
+                        if (rec_ptr2 != nullptr)
                         {
-                            it2->second.offset = new_offset;
+                            rec_ptr2->offset = new_offset;
                         }
                         m_uring_lock.unlock();
                     }
@@ -423,7 +378,6 @@ namespace HySerial
                 }
                 m_uring_lock.lock();
                 m_request_arena.erase(id);
-                m_active_requests.erase(id);
                 m_uring_lock.unlock();
             }
 
@@ -479,18 +433,19 @@ namespace HySerial
 
         // insert record first
         RequestRecord rec;
+        rec.id = id;
         rec.cb = std::move(callback);
         rec.is_write = false;
         rec.fd = m_fd;
         m_uring_lock.lock();
-        m_active_requests.emplace(id, std::move(rec));
+        m_request_arena.insert(id, rec);
 
         // submit SQE
         set_user_data(sqe, id);
 
         if (const int ret = io_uring_submit(&m_ring); ret < 0)
         {
-            m_active_requests.erase(id);
+            m_request_arena.erase(id);
             m_uring_lock.unlock();
             throw std::runtime_error(std::string("io_uring_submit failed with ") + std::to_string(ret));
         }

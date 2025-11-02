@@ -11,6 +11,5 @@ target_sources(HySerial PRIVATE ${HYSERIAL_SOURCES})
 target_include_directories(HySerial PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(HySerial PUBLIC
         tl::expected
-        unordered_dense::unordered_dense
         ${LIBURING_LIBRARY}
 )
