@@ -4,7 +4,7 @@ file(GLOB_RECURSE HYSERIAL_SOURCES "${PROJECT_SOURCE_DIR}/src/*.cpp")
 
 # Optional stasis/statistics sources
 if (HS_ENABLE_STASIS)
-    target_compile_definitions(HySerial PUBLIC HS_ENABLE_STASIS)
+  target_compile_definitions(HySerial PUBLIC HS_ENABLE_STASIS)
 endif ()
 
 target_sources(HySerial PRIVATE ${HYSERIAL_SOURCES})
@@ -16,3 +16,4 @@ target_link_libraries(HySerial PUBLIC
         tl::expected
         ${LIBURING_LIBRARY}
 )
+target_compile_features(HySerial PUBLIC cxx_std_20)
