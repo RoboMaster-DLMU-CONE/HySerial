@@ -7,6 +7,8 @@ option(HS_ENABLE_STASIS "Enable Stasis/statistics APIs for benchmarking" OFF)
 
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
 
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 include(FindModules)
 
 add_subdirectory(src)
