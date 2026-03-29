@@ -226,6 +226,28 @@ namespace HySerial
                         else
                         {
                             std::cerr << "[FATAL] UringManager: Read error res=" << res << ' ' << std::strerror(-res) <<
+                                '
+';
+                        }
+                        // cleanup record
+                        m_uring_lock.lock();
+                        m_request_arena.erase(id);
+                        m_uring_lock.unlock();
+                        
+                        // Restart read on minor/ignorable errors
+                        if (res == -EINTR || res == -EAGAIN || res == -EWOULDBLOCK)
+                        {
+                            if (m_continue_read.load(std::memory_order_relaxed))
+                            {
+                                need_rearm_read = true;
+                            }
+                        }
+                        
+                        continue;
+                    }
+                        else
+                        {
+                            std::cerr << "[FATAL] UringManager: Read error res=" << res << ' ' << std::strerror(-res) <<
                                 '\n';
                         }
                         // cleanup record
@@ -303,15 +325,26 @@ namespace HySerial
                     {
                         (*ecb_ptr)(res);
                     }
-                    else
-                    {
-                        std::cerr << "[FATAL] UringManager: Write error res=" << res << ' ' << std::strerror(-res) <<
-                            '\n';
-                    }
-                    m_uring_lock.lock();
-                    m_request_arena.erase(id);
-                    m_uring_lock.unlock();
-                    continue;
+                        else
+                        {
+                            std::cerr << "[FATAL] UringManager: Read error res=" << res << ' ' << std::strerror(-res) <<
+                                '
+';
+                        }
+                        // cleanup record
+                        m_uring_lock.lock();
+                        m_request_arena.erase(id);
+                        m_uring_lock.unlock();
+                        
+                        if (res == -EINTR || res == -EAGAIN || res == -EWOULDBLOCK)
+                        {
+                            if (m_continue_read.load(std::memory_order_relaxed))
+                            {
+                                need_rearm_read = true;
+                            }
+                        }
+                        
+                        continue;
                 }
 
                 // success: update offset and check completion
