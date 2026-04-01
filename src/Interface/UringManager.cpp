@@ -225,35 +225,21 @@ namespace HySerial
                         }
                         else
                         {
-                            std::cerr << "[FATAL] UringManager: Read error res=" << res << ' ' << std::strerror(-res) <<
-                                '
-';
+                            std::cerr << "[FATAL] UringManager: Read error res=" << res << ' ' << std::strerror(-res) << '\n';
                         }
+                        
                         // cleanup record
                         m_uring_lock.lock();
                         m_request_arena.erase(id);
                         m_uring_lock.unlock();
                         
-                        // Restart read on minor/ignorable errors
-                        if (res == -EINTR || res == -EAGAIN || res == -EWOULDBLOCK)
+                        // Restart read on ALL errors if continuous reading is enabled
+                        // This ensures the read loop continues even after device errors
+                        if (m_continue_read.load(std::memory_order_relaxed))
                         {
-                            if (m_continue_read.load(std::memory_order_relaxed))
-                            {
-                                need_rearm_read = true;
-                            }
+                            need_rearm_read = true;
                         }
                         
-                        continue;
-                    }
-                        else
-                        {
-                            std::cerr << "[FATAL] UringManager: Read error res=" << res << ' ' << std::strerror(-res) <<
-                                '\n';
-                        }
-                        // cleanup record
-                        m_uring_lock.lock();
-                        m_request_arena.erase(id);
-                        m_uring_lock.unlock();
                         continue;
                     }
 
@@ -325,26 +311,18 @@ namespace HySerial
                     {
                         (*ecb_ptr)(res);
                     }
-                        else
-                        {
-                            std::cerr << "[FATAL] UringManager: Read error res=" << res << ' ' << std::strerror(-res) <<
-                                '
-';
-                        }
-                        // cleanup record
-                        m_uring_lock.lock();
-                        m_request_arena.erase(id);
-                        m_uring_lock.unlock();
-                        
-                        if (res == -EINTR || res == -EAGAIN || res == -EWOULDBLOCK)
-                        {
-                            if (m_continue_read.load(std::memory_order_relaxed))
-                            {
-                                need_rearm_read = true;
-                            }
-                        }
-                        
-                        continue;
+                    else
+                    {
+                        std::cerr << "[FATAL] UringManager: Write error res=" << res << ' ' << std::strerror(-res) << '\n';
+                    }
+                    
+                    // cleanup record and release buffer
+                    m_uring_lock.lock();
+                    m_request_arena.erase(id);
+                    if (record.buf) m_buffer_pool.release(record.buf);
+                    m_uring_lock.unlock();
+                    
+                    continue;
                 }
 
                 // success: update offset and check completion
