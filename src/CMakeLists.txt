@@ -14,6 +14,6 @@ target_include_directories(HySerial PUBLIC
 )
 target_link_libraries(HySerial PUBLIC
         tl::expected
-        ${LIBURING_LIBRARY}
+        Liburing::Liburing
 )
 target_compile_features(HySerial PUBLIC cxx_std_20)
