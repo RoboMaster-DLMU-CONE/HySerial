@@ -92,6 +92,14 @@ static speed_t baud_to_speed(uint32_t baud) {
   case 921600:
     return B921600;
 #endif
+#ifdef B1500000
+  case 1500000:
+    return B1500000;
+#endif
+#ifdef B3000000
+  case 3000000:
+    return B3000000;
+#endif
   default:
     return 0;
   }
