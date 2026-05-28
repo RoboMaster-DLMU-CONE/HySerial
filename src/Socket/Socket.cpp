@@ -5,8 +5,18 @@
 #include <fcntl.h>
 #include <format>
 #include <sys/ioctl.h>
-#include <termios.h>
+#include <asm/termbits.h>
 #include <unistd.h>
+
+#ifndef TCIFLUSH
+#define TCIFLUSH 0
+#endif
+#ifndef TCOFLUSH
+#define TCOFLUSH 1
+#endif
+#ifndef TCIOFLUSH
+#define TCIOFLUSH 2
+#endif
 
 using tl::unexpected, std::format;
 
@@ -27,7 +37,7 @@ bool is_fd_in_stale_state(int fd) {
 }
 
 void reset_stale_fd(int fd) {
-  tcflush(fd, TCIOFLUSH);
+  ioctl(fd, TCFLSH, TCIOFLUSH);
 
   int status = 0;
   if (ioctl(fd, TIOCMGET, &status) == -1) {
@@ -44,66 +54,6 @@ void reset_stale_fd(int fd) {
 } // namespace
 
 namespace HySerial {
-static speed_t baud_to_speed(uint32_t baud) {
-  switch (baud) {
-  case 0:
-    return B0;
-  case 50:
-    return B50;
-  case 75:
-    return B75;
-  case 110:
-    return B110;
-  case 134:
-    return B134;
-  case 150:
-    return B150;
-  case 200:
-    return B200;
-  case 300:
-    return B300;
-  case 600:
-    return B600;
-  case 1200:
-    return B1200;
-  case 1800:
-    return B1800;
-  case 2400:
-    return B2400;
-  case 4800:
-    return B4800;
-  case 9600:
-    return B9600;
-  case 19200:
-    return B19200;
-  case 38400:
-    return B38400;
-  case 57600:
-    return B57600;
-  case 115200:
-    return B115200;
-  case 230400:
-    return B230400;
-#ifdef B460800
-  case 460800:
-    return B460800;
-#endif
-#ifdef B921600
-  case 921600:
-    return B921600;
-#endif
-#ifdef B1500000
-  case 1500000:
-    return B1500000;
-#endif
-#ifdef B3000000
-  case 3000000:
-    return B3000000;
-#endif
-  default:
-    return 0;
-  }
-}
 
 Socket::Socket(const SerialConfig &cfg) : config(cfg) {}
 
@@ -160,8 +110,8 @@ tl::expected<void, Error> Socket::ensure_connected() noexcept {
               format("Serial device '{}' is already in use", dev_path)});
   }
 
-  termios tty{};
-  if (tcgetattr(sock_fd, &tty) == -1) {
+  struct termios2 tio{};
+  if (ioctl(sock_fd, TCGETS2, &tio) == -1) {
     close(sock_fd);
     sock_fd = -1;
     return unexpected(Error{ErrorCode::SocketBindError,
@@ -169,85 +119,78 @@ tl::expected<void, Error> Socket::ensure_connected() noexcept {
                                    dev_path, strerror(errno))});
   }
 
-  // Set baud
-  const speed_t speed = baud_to_speed(config.baud_rate);
-  if (speed == 0) {
-    close(sock_fd);
-    sock_fd = -1;
-    return unexpected(
-        Error{ErrorCode::SocketBindError,
-              format("Unsupported baud rate {}", config.baud_rate)});
-  }
-  if (cfsetispeed(&tty, speed) == -1 || cfsetospeed(&tty, speed) == -1) {
-    close(sock_fd);
-    sock_fd = -1;
-    return unexpected(Error{ErrorCode::SocketBindError,
-                            format("Failed to set baud rate for '{}': {}",
-                                   dev_path, strerror(errno))});
+  // Set baud rate using termios2 BOTHER (supports arbitrary baud rates)
+  tio.c_cflag &= ~CBAUD;
+  if (config.baud_rate == 0) {
+    tio.c_cflag |= B0;
+  } else {
+    tio.c_cflag |= BOTHER;
+    tio.c_ispeed = config.baud_rate;
+    tio.c_ospeed = config.baud_rate;
   }
 
   // Data bits
-  tty.c_cflag &= ~CSIZE;
+  tio.c_cflag &= ~CSIZE;
   switch (config.data_bits) {
   case DataBits::BITS_5:
-    tty.c_cflag |= CS5;
+    tio.c_cflag |= CS5;
     break;
   case DataBits::BITS_6:
-    tty.c_cflag |= CS6;
+    tio.c_cflag |= CS6;
     break;
   case DataBits::BITS_7:
-    tty.c_cflag |= CS7;
+    tio.c_cflag |= CS7;
     break;
   case DataBits::BITS_8:
-    tty.c_cflag |= CS8;
+    tio.c_cflag |= CS8;
     break;
   default:
-    tty.c_cflag |= CS8;
+    tio.c_cflag |= CS8;
     break;
   }
 
   // Parity
   if (config.parity == Parity::NONE) {
-    tty.c_cflag &= ~PARENB;
+    tio.c_cflag &= ~PARENB;
   } else {
-    tty.c_cflag |= PARENB;
+    tio.c_cflag |= PARENB;
     if (config.parity == Parity::ODD) {
-      tty.c_cflag |= PARODD;
+      tio.c_cflag |= PARODD;
     } else {
-      tty.c_cflag &= ~PARODD;
+      tio.c_cflag &= ~PARODD;
     }
   }
 
   // Stop bits
   if (config.stop_bits == StopBits::TWO) {
-    tty.c_cflag |= CSTOPB;
+    tio.c_cflag |= CSTOPB;
   } else {
-    tty.c_cflag &= ~CSTOPB;
+    tio.c_cflag &= ~CSTOPB;
   }
 
   // Flow control
   if (config.flow_control == FlowControl::RTS_CTS) {
-    tty.c_cflag |= CRTSCTS;
+    tio.c_cflag |= CRTSCTS;
   } else {
-    tty.c_cflag &= ~CRTSCTS;
+    tio.c_cflag &= ~CRTSCTS;
   }
 
   // Input flags - disable special handling
-  tty.c_iflag &=
+  tio.c_iflag &=
       ~(IGNBRK | BRKINT | ICRNL | INLCR | PARMRK | INPCK | ISTRIP | IXON);
 
   // Output flags - disable post processing
-  tty.c_oflag &= ~OPOST;
+  tio.c_oflag &= ~OPOST;
 
   // Local flags - raw mode
-  tty.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+  tio.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
 
   // Control characters - block until at least 1 byte is available
-  tty.c_cc[VMIN] = 1;
-  tty.c_cc[VTIME] = 0;
+  tio.c_cc[VMIN] = 1;
+  tio.c_cc[VTIME] = 0;
 
   // Apply attributes
-  if (tcsetattr(sock_fd, TCSANOW, &tty) == -1) {
+  if (ioctl(sock_fd, TCSETS2, &tio) == -1) {
     close(sock_fd);
     sock_fd = -1;
     return unexpected(Error{ErrorCode::SocketBindError,
@@ -269,7 +212,7 @@ tl::expected<void, Error> Socket::ensure_connected() noexcept {
   }
 
   // Flush and ensure blocking (clear O_NONBLOCK)
-  tcflush(sock_fd, TCIOFLUSH);
+  ioctl(sock_fd, TCFLSH, TCIOFLUSH);
   const int flags = fcntl(sock_fd, F_GETFL, 0);
   fcntl(sock_fd, F_SETFL, flags & ~O_NONBLOCK);
 
@@ -289,7 +232,7 @@ tl::expected<void, Error> Socket::flush() const noexcept {
                             "Cannot flush with invalid socket descriptor"});
   }
 
-  if (tcflush(sock_fd, TCIOFLUSH) == -1) {
+  if (ioctl(sock_fd, TCFLSH, TCIOFLUSH) == -1) {
     return unexpected(
         Error{ErrorCode::SocketFlushError,
               format("Failed to flush serial device: {}", strerror(errno))});
