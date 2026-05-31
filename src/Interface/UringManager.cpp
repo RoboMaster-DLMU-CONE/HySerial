@@ -3,6 +3,7 @@
 #include <format>
 #include <HySerial/Interface/UringManager.hpp>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 
 namespace HySerial
@@ -76,15 +77,23 @@ namespace HySerial
 
     void UringManager::start_read_for_fd(int fd, size_t buf_size)
     {
-        m_fd = fd;
-        m_read_buffer.assign(buf_size, std::byte{0});
+        {
+            std::lock_guard lock(m_uring_lock);
+            m_fd = fd;
+            if (!m_read_in_flight.load(std::memory_order_acquire))
+            {
+                m_read_buffer.assign(buf_size, std::byte{0});
+            }
+        }
         m_continue_read.store(true, std::memory_order_relaxed);
+        m_read_pending_rearm.store(false, std::memory_order_relaxed);
         submit_read();
     }
 
     void UringManager::stop_read_for_fd()
     {
         m_continue_read.store(false, std::memory_order_relaxed);
+        m_read_pending_rearm.store(false, std::memory_order_relaxed);
     }
 
     void UringManager::submit_read()
@@ -95,15 +104,20 @@ namespace HySerial
             return;
         }
 
+        // Single critical section: protect active_requests and submission with m_uring_lock
+        std::lock_guard lock(m_uring_lock);
+        if (m_read_in_flight.load(std::memory_order_acquire))
+        {
+            return;
+        }
+
         // allocate id
         uint64_t id = m_next_request_id.fetch_add(1);
 
-        // Single critical section: protect active_requests and submission with m_uring_lock
-        m_uring_lock.lock();
         io_uring_sqe* sqe = io_uring_get_sqe(&m_ring);
         if (!sqe)
         {
-            m_uring_lock.unlock();
+            m_read_pending_rearm.store(true, std::memory_order_release);
             return;
         }
 
@@ -111,7 +125,9 @@ namespace HySerial
         rec.id = id; // Phase 2: Store id for arena validation
         rec.is_write = false;
         rec.fd = m_fd;
-        m_request_arena.insert(id, rec);
+        m_requests.insert(id, rec);
+        m_read_in_flight.store(true, std::memory_order_release);
+        m_read_pending_rearm.store(false, std::memory_order_release);
 
         io_uring_prep_read(sqe, m_fd, m_read_buffer.data(), m_read_buffer.size(), -1);
         set_user_data(sqe, id);
@@ -119,11 +135,16 @@ namespace HySerial
         if (const int ret = io_uring_submit(&m_ring); ret < 0)
         {
             // cleanup
-            m_request_arena.erase(id);
-            m_uring_lock.unlock();
-            throw std::runtime_error(std::string("io_uring_submit failed with ") + std::to_string(ret));
+            m_requests.erase(id);
+            m_read_in_flight.store(false, std::memory_order_release);
+            m_read_pending_rearm.store(true, std::memory_order_release);
+            auto* ecb_ptr = m_error_cb_ptr.load(std::memory_order_acquire);
+            if (ecb_ptr && *ecb_ptr)
+            {
+                (*ecb_ptr)(ret);
+            }
+            return;
         }
-        m_uring_lock.unlock();
     }
 
     void UringManager::submit_send(std::span<const std::byte> buffer)
@@ -156,7 +177,7 @@ namespace HySerial
         rec.fd = m_fd;
         rec.buf = buf;
         rec.offset = 0;
-        m_request_arena.insert(id, rec);
+        m_requests.insert(id, rec);
 
         // prepare initial write for the whole buffer
         io_uring_prep_write(sqe, m_fd, buf->data(), buf->size(), -1);
@@ -165,7 +186,7 @@ namespace HySerial
         if (const int ret = io_uring_submit(&m_ring); ret < 0)
         {
             // cleanup
-            m_request_arena.erase(id);
+            m_requests.erase(id);
             m_buffer_pool.release(buf);
             m_uring_lock.unlock();
             throw std::runtime_error(std::string("io_uring_submit failed with ") + std::to_string(ret));
@@ -200,8 +221,7 @@ namespace HySerial
                 // lookup and copy request record atomically, then release lock before any submit calls
                 m_uring_lock.lock();
 
-                // Phase 2: O(1) lookup using RequestArena
-                RequestRecord* rec_ptr = m_request_arena.find(id);
+                RequestRecord* rec_ptr = m_requests.find(id);
                 if (!rec_ptr)
                 {
                     m_uring_lock.unlock();
@@ -230,7 +250,8 @@ namespace HySerial
                         
                         // cleanup record
                         m_uring_lock.lock();
-                        m_request_arena.erase(id);
+                        m_requests.erase(id);
+                        m_read_in_flight.store(false, std::memory_order_release);
                         m_uring_lock.unlock();
                         
                         // Restart read on ALL errors if continuous reading is enabled
@@ -259,7 +280,8 @@ namespace HySerial
 
                     // remove record and request rearm after CQ processing
                     m_uring_lock.lock();
-                    m_request_arena.erase(id);
+                    m_requests.erase(id);
+                    m_read_in_flight.store(false, std::memory_order_release);
                     m_uring_lock.unlock();
                     if (m_continue_read.load(std::memory_order_relaxed))
                     {
@@ -281,7 +303,7 @@ namespace HySerial
                         if (ecb_ptr && *ecb_ptr) (*ecb_ptr)(-EINTR);
                         // cleanup record
                         m_uring_lock.lock();
-                        m_request_arena.erase(id);
+                        m_requests.erase(id);
                         m_uring_lock.unlock();
                         continue;
                     }
@@ -294,7 +316,7 @@ namespace HySerial
                         auto* ecb_ptr = m_error_cb_ptr.load(std::memory_order_acquire);
                         if (ecb_ptr && *ecb_ptr) (*ecb_ptr)(ret);
                         m_uring_lock.lock();
-                        m_request_arena.erase(id);
+                        m_requests.erase(id);
                         m_uring_lock.unlock();
                     }
                     else
@@ -318,7 +340,7 @@ namespace HySerial
                     
                     // cleanup record and release buffer
                     m_uring_lock.lock();
-                    m_request_arena.erase(id);
+                    m_requests.erase(id);
                     if (record.buf) m_buffer_pool.release(record.buf);
                     m_uring_lock.unlock();
                     
@@ -338,7 +360,7 @@ namespace HySerial
                         auto* ecb_ptr = m_error_cb_ptr.load(std::memory_order_acquire);
                         if (ecb_ptr && *ecb_ptr) (*ecb_ptr)(-EAGAIN);
                         m_uring_lock.lock();
-                        m_request_arena.erase(id);
+                        m_requests.erase(id);
                         if (record.buf) m_buffer_pool.release(record.buf);
                         m_uring_lock.unlock();
                         continue;
@@ -352,7 +374,7 @@ namespace HySerial
                         auto* ecb_ptr = m_error_cb_ptr.load(std::memory_order_acquire);
                         if (ecb_ptr && *ecb_ptr) (*ecb_ptr)(ret);
                         m_uring_lock.lock();
-                        m_request_arena.erase(id);
+                        m_requests.erase(id);
                         if (record.buf) m_buffer_pool.release(record.buf);
                         m_uring_lock.unlock();
                     }
@@ -361,7 +383,7 @@ namespace HySerial
                         m_uring_lock.unlock();
                         // update stored offset now that resubmit succeeded
                         m_uring_lock.lock();
-                        RequestRecord* rec_ptr2 = m_request_arena.find(id);
+                        RequestRecord* rec_ptr2 = m_requests.find(id);
                         if (rec_ptr2 != nullptr)
                         {
                             rec_ptr2->offset = new_offset;
@@ -388,7 +410,7 @@ namespace HySerial
                     m_buffer_pool.release(record.buf);
                 }
                 m_uring_lock.lock();
-                m_request_arena.erase(id);
+                m_requests.erase(id);
                 m_uring_lock.unlock();
             }
 
@@ -398,7 +420,8 @@ namespace HySerial
             }
 
             // re-arm read if any completion requested it
-            if (need_rearm_read)
+            if (need_rearm_read || (m_continue_read.load(std::memory_order_relaxed) &&
+                                    m_read_pending_rearm.load(std::memory_order_acquire)))
             {
                 submit_read();
             }
@@ -427,8 +450,7 @@ namespace HySerial
             });
         }
 
-        // Phase 2: Initialize RequestArena for O(1) request tracking
-        m_request_arena = RequestArena(queue_depth);
+        (void)queue_depth;
 
         // Phase 2: Initialize BufferPool for zero-copy writes
         // Pool size is 2x queue_depth to account for concurrent writes
@@ -449,14 +471,14 @@ namespace HySerial
         rec.is_write = false;
         rec.fd = m_fd;
         m_uring_lock.lock();
-        m_request_arena.insert(id, rec);
+        m_requests.insert(id, rec);
 
         // submit SQE
         set_user_data(sqe, id);
 
         if (const int ret = io_uring_submit(&m_ring); ret < 0)
         {
-            m_request_arena.erase(id);
+            m_requests.erase(id);
             m_uring_lock.unlock();
             throw std::runtime_error(std::string("io_uring_submit failed with ") + std::to_string(ret));
         }

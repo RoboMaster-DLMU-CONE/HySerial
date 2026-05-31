@@ -6,6 +6,7 @@
 #include <memory>
 #include <span>
 #include <atomic>
+#include <unordered_map>
 #include <vector>
 
 #include <tl/expected.hpp>
@@ -92,7 +93,7 @@ namespace HySerial
         using CompletionCallback = std::function<void(const io_uring_cqe*)>;
 
     private:
-        // RequestRecord 需要在 RequestArena 前面定义
+        // RequestRecord must be defined before RequestRegistry.
         struct RequestRecord
         {
             CompletionCallback cb;
@@ -103,62 +104,32 @@ namespace HySerial
             bool is_write{false};
         };
 
-        // Phase 2: RequestArena - O(1) request tracking using array indexing
-        class RequestArena
+        class RequestRegistry
         {
         public:
-            explicit RequestArena(uint32_t queue_depth = 0)
-                : m_queue_depth(queue_depth),
-                  m_records(queue_depth),
-                  m_occupied(queue_depth)
-            {
-                for (auto& occ : m_occupied)
-                {
-                    occ.store(false, std::memory_order_relaxed);
-                }
-            }
-
             void insert(uint64_t id, const RequestRecord& rec)
             {
-                if (m_queue_depth == 0) return;
-                const uint32_t idx = id % m_queue_depth;
-                m_records[idx] = rec;
-                m_occupied[idx].store(true, std::memory_order_release);
+                m_records[id] = rec;
             }
 
             RequestRecord* find(uint64_t id)
             {
-                if (m_queue_depth == 0) return nullptr;
-                uint32_t idx = id % m_queue_depth;
-                if (m_occupied[idx].load(std::memory_order_acquire))
-                {
-                    if (m_records[idx].id == id)
-                    {
-                        return &m_records[idx];
-                    }
-                }
-                return nullptr;
+                auto it = m_records.find(id);
+                return it == m_records.end() ? nullptr : &it->second;
             }
 
             void erase(uint64_t id)
             {
-                if (m_queue_depth == 0) return;
-                const uint32_t idx = id % m_queue_depth;
-                m_occupied[idx].store(false, std::memory_order_release);
+                m_records.erase(id);
             }
 
             void clear()
             {
-                for (auto& occ : m_occupied)
-                {
-                    occ.store(false, std::memory_order_relaxed);
-                }
+                m_records.clear();
             }
 
         private:
-            uint32_t m_queue_depth;
-            std::vector<RequestRecord> m_records;
-            std::vector<std::atomic<bool>> m_occupied;
+            std::unordered_map<uint64_t, RequestRecord> m_records;
         };
 
         // Phase 2: BufferPool - Zero-copy buffer reuse for writes
@@ -238,8 +209,7 @@ namespace HySerial
         // 提交异步读请求（不对外公开）
         void submit_read();
 
-        // Phase 2: Replace unordered_map with RequestArena
-        RequestArena m_request_arena;
+        RequestRegistry m_requests;
 
         // Phase 2: Buffer pool for zero-copy writes
         BufferPool m_buffer_pool;
@@ -254,6 +224,8 @@ namespace HySerial
         int m_fd{-1};
         std::vector<std::byte> m_read_buffer;
         std::atomic<bool> m_continue_read{false};
+        std::atomic<bool> m_read_in_flight{false};
+        std::atomic<bool> m_read_pending_rearm{false};
 
         // Phase 1 optimization: Single unified lock for io_uring and active_requests
         SpinLock m_uring_lock;
