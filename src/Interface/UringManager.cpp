@@ -5,6 +5,7 @@
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
+#include <vector>
 
 namespace HySerial
 {
@@ -201,37 +202,85 @@ namespace HySerial
 
         while (m_is_running.load())
         {
-            io_uring_submit_and_wait(&m_ring, 1);
+            struct Completion
+            {
+                uint64_t id{0};
+                int res{0};
+                RequestRecord record{};
+                bool found{false};
+            };
 
-            io_uring_cqe* cqe;
-            unsigned head;
-            unsigned cqe_count = 0;
+            std::vector<Completion> completions;
 
             bool need_rearm_read = false;
-            io_uring_for_each_cqe(&m_ring, head, cqe)
+
             {
-                cqe_count++;
+                std::lock_guard lock(m_uring_lock);
+                if (const int ret = io_uring_submit(&m_ring); ret < 0)
+                {
+                    auto* ecb_ptr = m_error_cb_ptr.load(std::memory_order_acquire);
+                    if (ecb_ptr && *ecb_ptr)
+                    {
+                        (*ecb_ptr)(ret);
+                    }
+                }
+            }
 
-                uint64_t id = get_user_data_id(cqe);
-                if (id == 0)
+            io_uring_cqe* first_cqe = nullptr;
+            if (const int ret = io_uring_wait_cqe(&m_ring, &first_cqe); ret < 0)
+            {
+                auto* ecb_ptr = m_error_cb_ptr.load(std::memory_order_acquire);
+                if (ecb_ptr && *ecb_ptr)
+                {
+                    (*ecb_ptr)(ret);
+                }
+                continue;
+            }
+
+            {
+                std::lock_guard lock(m_uring_lock);
+                io_uring_cqe* cqe;
+                unsigned head;
+                unsigned cqe_count = 0;
+
+                io_uring_for_each_cqe(&m_ring, head, cqe)
+                {
+                    cqe_count++;
+
+                    Completion completion;
+                    completion.id = get_user_data_id(cqe);
+                    completion.res = cqe->res;
+
+                    if (completion.id != 0)
+                    {
+                        if (RequestRecord* rec_ptr = m_requests.find(completion.id))
+                        {
+                            completion.record = *rec_ptr;
+                            completion.found = true;
+                        }
+                    }
+
+                    completions.push_back(std::move(completion));
+                }
+
+                if (cqe_count > 0)
+                {
+                    io_uring_cq_advance(&m_ring, cqe_count);
+                }
+            }
+
+            for (const auto& completion : completions)
+            {
+                if (completion.id == 0 || !completion.found)
                 {
                     continue;
                 }
 
-                // lookup and copy request record atomically, then release lock before any submit calls
-                m_uring_lock.lock();
-
-                RequestRecord* rec_ptr = m_requests.find(id);
-                if (!rec_ptr)
-                {
-                    m_uring_lock.unlock();
-                    continue;
-                }
-                RequestRecord record = *rec_ptr;
-                m_uring_lock.unlock();
+                const uint64_t id = completion.id;
+                RequestRecord record = completion.record;
 
                 bool is_write = record.is_write;
-                int res = cqe->res;
+                int res = completion.res;
                 if (!is_write)
                 {
                     // read completion: report bytes read and mark rearm if needed
@@ -412,11 +461,6 @@ namespace HySerial
                 m_uring_lock.lock();
                 m_requests.erase(id);
                 m_uring_lock.unlock();
-            }
-
-            if (cqe_count > 0)
-            {
-                io_uring_cq_advance(&m_ring, cqe_count);
             }
 
             // re-arm read if any completion requested it
